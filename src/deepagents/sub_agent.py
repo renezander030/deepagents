@@ -9,6 +9,7 @@ from langchain_core.language_models import LanguageModelLike
 from langchain.chat_models import init_chat_model
 from typing import Annotated, NotRequired, Any, Union
 from langgraph.types import Command
+import asyncio
 
 from langgraph.prebuilt import InjectedState
 
@@ -68,18 +69,30 @@ def _create_task_tool(tools, instructions, subagents: list[SubAgent], model, sta
     ):
         if subagent_type not in agents:
             return f"Error: invoked agent of type {subagent_type}, the only allowed types are {[f'`{k}`' for k in agents]}"
+
         sub_agent = agents[subagent_type]
         state["messages"] = [{"role": "user", "content": description}]
-        result = await sub_agent.ainvoke(state)
-        return Command(
-            update={
-                "files": result.get("files", {}),
-                "messages": [
-                    ToolMessage(
-                        result["messages"][-1].content, tool_call_id=tool_call_id
-                    )
-                ],
-            }
-        )
+
+        # Use the asynchronous ainvoke method for StructuredTool compatibility
+        try:
+            result = await sub_agent.ainvoke(state)
+
+            # Extract the response content
+            if result and "messages" in result and result["messages"]:
+                response_content = result["messages"][-1].content
+
+                # Update the state with files if any were created
+                if "files" in result:
+                    # Update the current state with new files
+                    current_files = state.get("files", {})
+                    current_files.update(result["files"])
+                    state["files"] = current_files
+
+                return response_content
+            else:
+                return "Subagent completed but returned no response."
+
+        except Exception as e:
+            return f"Error executing subagent: {str(e)}"
 
     return task

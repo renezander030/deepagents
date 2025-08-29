@@ -3,6 +3,7 @@ import ssl
 from typing import Literal
 from pathlib import Path
 from dotenv import load_dotenv
+from datetime import datetime
 
 from tavily import TavilyClient
 from langchain.chat_models import init_chat_model
@@ -39,8 +40,9 @@ requests.Session.request = patched_request
 tavily_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
 
 # Configure Azure OpenAI model with SSL verification disabled for corporate proxy
-# Create httpx client with SSL verification disabled
-http_client = httpx.Client(verify=False)
+# Create both sync and async httpx clients with SSL verification disabled
+sync_http_client = httpx.Client(verify=False)
+async_http_client = httpx.AsyncClient(verify=False)
 
 azure_model = AzureChatOpenAI(
     azure_deployment=os.environ["AZURE_MODEL_DEPLOYMENT"],
@@ -48,7 +50,8 @@ azure_model = AzureChatOpenAI(
     api_key=os.environ["AZURE_AI_API_KEY"],
     api_version=os.environ["AZURE_AI_API_VERSION"],
     max_tokens=32000,  # Reduced to fit within gpt-4.1-nano limits
-    http_client=http_client
+    http_client=sync_http_client,
+    http_async_client=async_http_client
 )
 
 # Search tool to use to do research
@@ -83,15 +86,11 @@ research_sub_agent = {
 
 sub_critique_prompt = """You are a dedicated editor. You are being tasked to critique a report.
 
-You can find the report at `final_report.md`.
-
-You can find the question/topic for this report at `question.txt`.
+First, use the `ls` tool to see what files are available, then use `read_file` to read the report and question files.
 
 The user may ask for specific areas to critique the report in. Respond to the user with a detailed critique of the report. Things that could be improved.
 
-You can use the search tool to search for information, if that will help you critique the report
-
-Do not write to the `final_report.md` yourself.
+Do not edit the report files yourself - only provide critique and suggestions.
 
 Things to check:
 - Check that each section is appropriately named
@@ -111,25 +110,50 @@ critique_sub_agent = {
 
 
 # Prompt prefix to steer the agent to be an expert researcher
-research_instructions = """You are an expert researcher. Your job is to conduct thorough research, and then write a polished report.
+research_instructions = """You are an expert researcher. Your job is to conduct thorough research, write a polished report, get it critiqued, and save all files.
+
+CRITICAL: You MUST complete ALL steps of the workflow. Do not stop early. You must create 3 files: question.txt, report.md, and critique.md.
 
 CRITICAL FILE WRITING REQUIREMENTS:
-1. FIRST: Create a unique filename prefix using current date and timestamp (format: YYYYMMDD_HHMMSS)
+1. FIRST: Create a unique filename prefix using current date and timestamp from datetime.now() (format: YYYYMMDD_HHMMSS)
 2. THEN: Use the write_file tool to write the original user question to `{timestamp}_question.txt`
-3. CONDUCT: Your research using available tools
-4. FINALLY: Use the write_file tool to write your comprehensive report to `{timestamp}_report.md`
+3. CONDUCT: Your research using the research-agent subagent (use the task tool)
+4. WRITE: Use the write_file tool to write your comprehensive report to `{timestamp}_report.md`
+5. CRITIQUE: Use the critique-agent subagent to review the report
+6. SAVE CRITIQUE: Use the write_file tool to save the critique to `{timestamp}_critique.md`
+7. REVISE: If needed, revise the report based on critique feedback
 
-You MUST use the write_file tool for both files with unique timestamped names. Do not skip this step!
+You MUST use the write_file tool for all files with unique timestamped names. Generate the timestamp at the start using datetime.now().strftime("%Y%m%d_%H%M%S"). Do not skip this step!
+
+CRITICAL: You are FORBIDDEN from using the internet_search tool directly. You MUST ONLY use the task tool to delegate research to the research-agent subagent. If you use internet_search yourself, you are violating the workflow.
 
 Example filenames:
 - 20250129_143052_question.txt
 - 20250129_143052_report.md
 
-Use the research-agent to conduct deep research. It will respond to your questions/topics with a detailed answer.
+MANDATORY WORKFLOW (FOLLOW EVERY STEP - NO EXCEPTIONS):
+1. Generate timestamp using datetime.now().strftime("%Y%m%d_%H%M%S")
+2. Write question to file: write_file(file_path="{timestamp}_question.txt", content="[user question]")
+3. Delegate research: task(description="[research request]", subagent_type="research-agent")
+4. Write report to file: write_file(file_path="{timestamp}_report.md", content="[research findings]")
+5. Delegate critique: task(description="[critique request]", subagent_type="critique-agent")
+6. Save critique to file: write_file(file_path="{timestamp}_critique.md", content="# Critique Feedback\n\n[critique response]")
+7. If needed, revise report and repeat steps 5-6
 
-When you have enough information to write a final report, use the write_file tool to write it to the timestamped report file.
+YOU MUST COMPLETE ALL STEPS. Do not stop after step 3.
 
-You can call the critique-agent to get a critique of the final report. After that (if needed) you can do more research and edit the `final_report.md`
+Example: task(description="Research the latest developments in sustainable packaging", subagent_type="research-agent")
+
+The research-agent will conduct deep research and respond with detailed findings. You must then use write_file to save the comprehensive report.
+
+After writing the report, you MUST call the critique-agent: task(description="Critique the report for completeness, accuracy, and quality. Provide specific feedback and suggestions for improvement.", subagent_type="critique-agent")
+
+CRITICAL: After getting critique feedback from the task tool, you MUST immediately save the critique response to a file: write_file(file_path="{timestamp}_critique.md", content="# Critique Feedback\n\n[exact critique response from the task tool]")
+
+This is MANDATORY so we can verify the critique agent actually worked and see its feedback. Do NOT skip this step!
+
+REMEMBER: You must complete the ENTIRE workflow - research, write report, critique, save critique. Do not stop early!
+
 You can do this however many times you want until are you satisfied with the result.
 
 Only edit the file once at a time (if you call this tool in parallel, there may be conflicts).
@@ -213,15 +237,16 @@ Generate the timestamp at the beginning of your task and use it consistently for
 """
 
 # Create the agent using Azure OpenAI model
+# Main agent has internet_search available for subagents but should delegate research
 agent = create_deep_agent(
-    [internet_search],
+    [internet_search],  # Available for subagents to use
     research_instructions,
     model=azure_model,
     subagents=[critique_sub_agent, research_sub_agent],
 ).with_config({"recursion_limit": 1000})
 
 # Test the agent setup
-if __name__ == "__main__":
+async def main():
     print("Research Agent initialized successfully!")
     print(f"Using Azure OpenAI model: {os.environ['AZURE_MODEL_DEPLOYMENT']}")
     print(f"Azure endpoint: {os.environ['AZURE_AI_ENDPOINT']}")
@@ -232,12 +257,63 @@ if __name__ == "__main__":
     print("="*50)
 
     try:
-        # Run the research agent with debugging
-        query = "Research the latest developments in Packaging"
+        # Run the research agent with real-time streaming
+        query = "Research the latest developments in Mushroom-based Packaging"
         print(f"Query: {query}")
-        print("Invoking agent...")
+        print("Invoking agent with real-time output...")
+        print("\n" + "="*50)
+        print("REAL-TIME EXECUTION LOG")
+        print("="*50)
 
-        result = agent.invoke({"messages": [{"role": "user", "content": query}]})
+        # Stream the agent execution to see real-time events
+        result = None
+        async for chunk in agent.astream(
+            {"messages": [{"role": "user", "content": query}]},
+            stream_mode="values"
+        ):
+            if "messages" in chunk and chunk["messages"]:
+                last_message = chunk["messages"][-1]
+
+                # Print AI messages and tool calls in real-time
+                if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
+                    for tool_call in last_message.tool_calls:
+                        tool_name = tool_call.get('name', 'unknown')
+                        tool_args = tool_call.get('args', {})
+                        print(f"🔧 TOOL CALL: {tool_name}")
+                        if tool_name == 'task':
+                            subagent_type = tool_args.get('subagent_type', 'unknown')
+                            description = tool_args.get('description', '')[:100] + '...'
+                            print(f"   🤖 SUBAGENT: {subagent_type}")
+                            print(f"   📝 TASK: {description}")
+                        elif tool_name == 'write_file':
+                            file_path = tool_args.get('file_path', 'unknown')
+                            content_length = len(tool_args.get('content', ''))
+                            if 'critique' in file_path:
+                                print(f"   📝 CRITIQUE FILE: {file_path} ({content_length} chars)")
+                            else:
+                                print(f"   📄 FILE: {file_path} ({content_length} chars)")
+                        else:
+                            print(f"   📋 ARGS: {str(tool_args)[:100]}...")
+
+                elif hasattr(last_message, 'name') and hasattr(last_message, 'content'):
+                    # Tool response
+                    tool_name = last_message.name
+                    content_length = len(last_message.content)
+                    print(f"✅ TOOL RESPONSE: {tool_name} ({content_length} chars)")
+
+                    # Show critique agent feedback in detail
+                    if tool_name == 'task' and 'critique' in last_message.content.lower():
+                        print(f"📝 CRITIQUE FEEDBACK:")
+                        # Show first 300 chars of critique
+                        critique_preview = last_message.content[:300] + '...' if len(last_message.content) > 300 else last_message.content
+                        print(f"   {critique_preview}")
+
+                elif hasattr(last_message, 'content') and last_message.content:
+                    # AI response
+                    content_preview = last_message.content[:100] + '...' if len(last_message.content) > 100 else last_message.content
+                    print(f"💬 AI: {content_preview}")
+
+            result = chunk  # Keep the last chunk as result
 
         print("\n" + "="*50)
         print("AGENT EXECUTION COMPLETED")
@@ -256,6 +332,22 @@ if __name__ == "__main__":
                     print(f"     Question: {content}")
                 elif filename.endswith('_report.md'):
                     print(f"     Report preview: {content[:200]}...")
+                elif filename.endswith('_critique.md'):
+                    print(f"     📝 CRITIQUE FEEDBACK:")
+                    print(f"     {content[:300]}..." if len(content) > 300 else f"     {content}")
+
+            # Create actual files on disk
+            print("\n" + "="*50)
+            print("CREATING ACTUAL FILES ON DISK")
+            print("="*50)
+
+            for filename, content in result["files"].items():
+                try:
+                    with open(filename, "w", encoding="utf-8") as f:
+                        f.write(content)
+                    print(f"✅ Created actual file: {filename}")
+                except Exception as e:
+                    print(f"❌ Failed to create {filename}: {e}")
         else:
             print("❌ No files found in agent state")
 
@@ -284,15 +376,93 @@ if __name__ == "__main__":
                         f.write(final_content)
                     print(f"✅ Created {report_file}")
 
-        # Print the result
-        print("Result:")
+        # Analyze tool calls and subagent usage
+        print("\n" + "="*50)
+        print("DETAILED EXECUTION ANALYSIS")
+        print("="*50)
+
+        tool_calls_count = {}
+        subagent_calls = []
+        errors = []
+
         if result and "messages" in result:
             for i, msg in enumerate(result["messages"]):
-                print(f"Message {i+1}: {msg}")
-                print("-" * 30)
+                print(f"\n--- Message {i+1}: {type(msg).__name__} ---")
+
+                if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                    for tool_call in msg.tool_calls:
+                        tool_name = tool_call.get('name', 'unknown')
+                        tool_args = tool_call.get('args', {})
+
+                        # Count tool calls
+                        tool_calls_count[tool_name] = tool_calls_count.get(tool_name, 0) + 1
+
+                        print(f"  🔧 TOOL CALL: {tool_name}")
+                        print(f"     Args: {tool_args}")
+
+                        # Track subagent calls
+                        if tool_name == 'task':
+                            subagent_type = tool_args.get('subagent_type', 'unknown')
+                            description = tool_args.get('description', '')[:100] + '...'
+                            subagent_calls.append({
+                                'type': subagent_type,
+                                'description': description
+                            })
+                            print(f"     🤖 SUBAGENT: {subagent_type}")
+                            print(f"     📝 Task: {description}")
+
+                elif hasattr(msg, 'name') and hasattr(msg, 'content'):
+                    # Tool response message
+                    tool_name = msg.name
+                    content = msg.content
+
+                    print(f"  📤 TOOL RESPONSE: {tool_name}")
+
+                    if 'Error:' in content:
+                        errors.append({
+                            'tool': tool_name,
+                            'error': content[:200] + '...' if len(content) > 200 else content
+                        })
+                        print(f"     ❌ ERROR: {content[:100]}...")
+                    else:
+                        print(f"     ✅ SUCCESS: {len(content)} characters")
+                        if tool_name == 'internet_search':
+                            # Parse search results
+                            try:
+                                import json
+                                search_data = json.loads(content)
+                                if 'results' in search_data:
+                                    print(f"     🔍 Found {len(search_data['results'])} search results")
+                            except:
+                                pass
+
+                elif hasattr(msg, 'content') and msg.content:
+                    # Regular AI message
+                    content_preview = msg.content[:150] + '...' if len(msg.content) > 150 else msg.content
+                    print(f"  💬 AI RESPONSE: {content_preview}")
+
+        # Summary
+        print("\n" + "="*50)
+        print("EXECUTION SUMMARY")
+        print("="*50)
+
+        print(f"📊 Tool Calls Summary:")
+        for tool, count in tool_calls_count.items():
+            print(f"   {tool}: {count} calls")
+
+        if subagent_calls:
+            print(f"\n🤖 Subagent Calls: {len(subagent_calls)}")
+            for i, call in enumerate(subagent_calls, 1):
+                print(f"   {i}. {call['type']}: {call['description']}")
         else:
-            print("No messages in result")
-            print(f"Full result: {result}")
+            print(f"\n🤖 Subagent Calls: 0 (agent used direct tools)")
+
+        if errors:
+            print(f"\n❌ Errors Encountered: {len(errors)}")
+            for i, error in enumerate(errors, 1):
+                print(f"   {i}. {error['tool']}: {error['error']}")
+        else:
+            print(f"\n✅ No errors encountered")
 
     except Exception as e:
         print(f"\n❌ ERROR during execution: {e}")
@@ -303,6 +473,10 @@ if __name__ == "__main__":
     # user_query = input("\nEnter your research question (or press Enter to skip): ")
     # if user_query.strip():
     #     print(f"\nResearching: {user_query}")
-    #     result = agent.invoke({"messages": [{"role": "user", "content": user_query}]})
+    #     result = await agent.ainvoke({"messages": [{"role": "user", "content": user_query}]})
     #     print("\nResearch completed!")
     #     print("Check the generated files: question.txt and final_report.md")
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())

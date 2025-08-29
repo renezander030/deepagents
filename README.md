@@ -62,8 +62,15 @@ agent = create_deep_agent(
     research_instructions,
 )
 
-# Invoke the agent
-result = agent.invoke({"messages": [{"role": "user", "content": "what is langgraph?"}]})
+# Invoke the agent (async)
+import asyncio
+
+async def main():
+    result = await agent.ainvoke({"messages": [{"role": "user", "content": "what is langgraph?"}]})
+    return result
+
+# Run the async function
+result = asyncio.run(main())
 ```
 
 See [examples/research/research_agent.py](examples/research/research_agent.py) for a more complex example.
