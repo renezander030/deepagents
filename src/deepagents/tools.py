@@ -26,6 +26,7 @@ def write_todos(
     )
 
 
+@tool
 def ls(state: Annotated[DeepAgentState, InjectedState]) -> list[str]:
     """List all files"""
     return list(state.get("files", {}).keys())
@@ -77,6 +78,7 @@ def read_file(
     return "\n".join(result_lines)
 
 
+@tool
 def write_file(
     file_path: str,
     content: str,

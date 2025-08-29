@@ -1,13 +1,55 @@
 import os
+import ssl
 from typing import Literal
+from pathlib import Path
+from dotenv import load_dotenv
 
 from tavily import TavilyClient
-
+from langchain.chat_models import init_chat_model
+from langchain_openai import AzureChatOpenAI
+import httpx
 
 from deepagents import create_deep_agent, SubAgent
- 
+
+# Disable SSL verification for corporate proxy environments
+ssl._create_default_https_context = ssl._create_unverified_context
+os.environ["CURL_CA_BUNDLE"] = ""
+os.environ["REQUESTS_CA_BUNDLE"] = ""
+
+# Load environment variables from .env file in the same directory as this script
+script_dir = Path(__file__).parent
+env_path = script_dir / ".env"
+load_dotenv(env_path)
+
 # It's best practice to initialize the client once and reuse it.
+# Configure Tavily client with SSL verification disabled
+import requests
+import urllib3
+
+# Disable SSL warnings and verification globally
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Monkey patch requests to disable SSL verification
+original_request = requests.Session.request
+def patched_request(self, method, url, **kwargs):
+    kwargs['verify'] = False
+    return original_request(self, method, url, **kwargs)
+requests.Session.request = patched_request
+
 tavily_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+
+# Configure Azure OpenAI model with SSL verification disabled for corporate proxy
+# Create httpx client with SSL verification disabled
+http_client = httpx.Client(verify=False)
+
+azure_model = AzureChatOpenAI(
+    azure_deployment=os.environ["AZURE_MODEL_DEPLOYMENT"],
+    azure_endpoint=os.environ["AZURE_AI_ENDPOINT"],
+    api_key=os.environ["AZURE_AI_API_KEY"],
+    api_version=os.environ["AZURE_AI_API_VERSION"],
+    max_tokens=32000,  # Reduced to fit within gpt-4.1-nano limits
+    http_client=http_client
+)
 
 # Search tool to use to do research
 def internet_search(
@@ -71,11 +113,21 @@ critique_sub_agent = {
 # Prompt prefix to steer the agent to be an expert researcher
 research_instructions = """You are an expert researcher. Your job is to conduct thorough research, and then write a polished report.
 
-The first thing you should do is to write the original user question to `question.txt` so you have a record of it.
+CRITICAL FILE WRITING REQUIREMENTS:
+1. FIRST: Create a unique filename prefix using current date and timestamp (format: YYYYMMDD_HHMMSS)
+2. THEN: Use the write_file tool to write the original user question to `{timestamp}_question.txt`
+3. CONDUCT: Your research using available tools
+4. FINALLY: Use the write_file tool to write your comprehensive report to `{timestamp}_report.md`
+
+You MUST use the write_file tool for both files with unique timestamped names. Do not skip this step!
+
+Example filenames:
+- 20250129_143052_question.txt
+- 20250129_143052_report.md
 
 Use the research-agent to conduct deep research. It will respond to your questions/topics with a detailed answer.
 
-When you think you enough information to write a final report, write it to `final_report.md`
+When you have enough information to write a final report, use the write_file tool to write it to the timestamped report file.
 
 You can call the critique-agent to get a critique of the final report. After that (if needed) you can do more research and edit the `final_report.md`
 You can do this however many times you want until are you satisfied with the result.
@@ -85,9 +137,6 @@ Only edit the file once at a time (if you call this tool in parallel, there may 
 Here are instructions for writing the final report:
 
 <report_instructions>
-
-CRITICAL: Make sure the answer is written in the same language as the human messages! If you make a todo plan - you should note in the plan what language the report should be in so you dont forget!
-Note: the language the report should be in is the language the QUESTION is in, not the language/country that the question is ABOUT.
 
 Please create a detailed answer to the overall research brief that:
 1. Is well-organized with proper headings (# for title, ## for sections, ### for subsections)
@@ -133,10 +182,6 @@ For each section of the report, do the following:
 - Each section should be as long as necessary to deeply answer the question with the information you have gathered. It is expected that sections will be fairly long and verbose. You are writing a deep research report, and users will expect a thorough answer.
 - Use bullet points to list out information when appropriate, but by default, write in paragraph form.
 
-REMEMBER:
-The brief and research may be in English, but you need to translate this information to the right language when writing the final answer.
-Make sure the final answer report is in the SAME language as the human messages in the message history.
-
 Format the report in clear markdown with proper structure and include source references where appropriate.
 
 <Citation Rules>
@@ -156,11 +201,108 @@ You have access to a few tools.
 ## `internet_search`
 
 Use this to run an internet search for a given query. You can specify the number of results, the topic, and whether raw content should be included.
+
+## File Naming Convention
+
+IMPORTANT: Always create unique filenames using the current timestamp in YYYYMMDD_HHMMSS format.
+For example, if the current time is January 29, 2025 at 2:30:52 PM, use:
+- 20250129_143052_question.txt
+- 20250129_143052_report.md
+
+Generate the timestamp at the beginning of your task and use it consistently for both files.
 """
 
-# Create the agent
+# Create the agent using Azure OpenAI model
 agent = create_deep_agent(
     [internet_search],
     research_instructions,
+    model=azure_model,
     subagents=[critique_sub_agent, research_sub_agent],
 ).with_config({"recursion_limit": 1000})
+
+# Test the agent setup
+if __name__ == "__main__":
+    print("Research Agent initialized successfully!")
+    print(f"Using Azure OpenAI model: {os.environ['AZURE_MODEL_DEPLOYMENT']}")
+    print(f"Azure endpoint: {os.environ['AZURE_AI_ENDPOINT']}")
+    print("Agent is ready to use.")
+
+    print("\n" + "="*50)
+    print("STARTING RESEARCH TASK")
+    print("="*50)
+
+    try:
+        # Run the research agent with debugging
+        query = "Research the latest developments in Packaging"
+        print(f"Query: {query}")
+        print("Invoking agent...")
+
+        result = agent.invoke({"messages": [{"role": "user", "content": query}]})
+
+        print("\n" + "="*50)
+        print("AGENT EXECUTION COMPLETED")
+        print("="*50)
+
+        # Check for generated files in agent state
+        print("\n" + "="*50)
+        print("CHECKING GENERATED FILES")
+        print("="*50)
+
+        if "files" in result and result["files"]:
+            print("✅ Files found in agent state:")
+            for filename, content in result["files"].items():
+                print(f"  📄 {filename} ({len(content)} characters)")
+                if filename.endswith('_question.txt'):
+                    print(f"     Question: {content}")
+                elif filename.endswith('_report.md'):
+                    print(f"     Report preview: {content[:200]}...")
+        else:
+            print("❌ No files found in agent state")
+
+            # Fallback: create timestamped files manually
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            print(f"Creating fallback files with timestamp: {timestamp}")
+
+            question_file = f"{timestamp}_question.txt"
+            with open(question_file, "w", encoding="utf-8") as f:
+                f.write(query)
+            print(f"✅ Created {question_file}")
+
+            if result and "messages" in result:
+                # Find the last substantial message content
+                final_content = ""
+                for msg in reversed(result["messages"]):
+                    if hasattr(msg, 'content') and msg.content and len(msg.content) > 100:
+                        final_content = msg.content
+                        break
+
+                if final_content:
+                    report_file = f"{timestamp}_report.md"
+                    with open(report_file, "w", encoding="utf-8") as f:
+                        f.write(final_content)
+                    print(f"✅ Created {report_file}")
+
+        # Print the result
+        print("Result:")
+        if result and "messages" in result:
+            for i, msg in enumerate(result["messages"]):
+                print(f"Message {i+1}: {msg}")
+                print("-" * 30)
+        else:
+            print("No messages in result")
+            print(f"Full result: {result}")
+
+    except Exception as e:
+        print(f"\n❌ ERROR during execution: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # Uncomment the following lines to run an interactive test:
+    # user_query = input("\nEnter your research question (or press Enter to skip): ")
+    # if user_query.strip():
+    #     print(f"\nResearching: {user_query}")
+    #     result = agent.invoke({"messages": [{"role": "user", "content": user_query}]})
+    #     print("\nResearch completed!")
+    #     print("Check the generated files: question.txt and final_report.md")
